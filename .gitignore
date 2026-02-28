@@ -1,0 +1,60 @@
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.env/
+.venv/
+
+# ----------------------------
+# Dataset (CRITICAL)
+# ----------------------------
+reddit_memes_dataset/
+reddit_memes_dataset/memes/
+
+# Optional: ignore specific file if needed
+# reddit_memes_dataset/data.csv
+
+# ----------------------------
+# Outputs / Logs
+# ----------------------------
+outputs/
+*.log
+pipeline_output.log
+
+# ----------------------------
+# Large files (extra safety)
+# ----------------------------
+*.csv
+*.zip
+*.tar
+*.gz
+*.h5
+*.pt
+*.pth
+*.png
+*.jpg
+*.jpeg
+
+# ----------------------------
+# Jupyter / Colab
+# ----------------------------
+.ipynb_checkpoints/
+
+# ----------------------------
+# OS / Editor
+# ----------------------------
+.DS_Store
+.vscode/
+.idea/
+
+# ----------------------------
+# Misc
+# ----------------------------
+*.tmp
+*.swp
