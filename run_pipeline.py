@@ -30,7 +30,7 @@ if __name__ == "__main__":
     print(f"Logging pipeline output to {log_path}")
     # redirect both stdout and stderr
     from contextlib import redirect_stdout, redirect_stderr
-    with open(log_path, "w") as log_file:
+    with open(log_path, "w", encoding="utf-8") as log_file:
         with redirect_stdout(log_file), redirect_stderr(log_file):
             main()
     # also write a copy to terminal when finished

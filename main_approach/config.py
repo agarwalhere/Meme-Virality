@@ -19,35 +19,35 @@ print(f"Using device: {DEVICE}")
 # ============ MODEL HYPERPARAMETERS ============
 # Hypergraph Model
 HYPERGRAPH_EPOCHS = 100
-HYPERGRAPH_HIDDEN_DIM = 64
+HYPERGRAPH_HIDDEN_DIM = 128
 HYPERGRAPH_LEARNING_RATE = 0.001
 HYPERGRAPH_BATCH_SIZE = 64
 HYPERGRAPH_N_CLUSTERS = 8
 
-# Image Model (ResNet50)
-IMAGE_EPOCHS = 10
-IMAGE_LEARNING_RATE = 1e-4
+# Image Model (EfficientNet-B0)
+IMAGE_EPOCHS = 8
+IMAGE_LEARNING_RATE = 3e-4
 IMAGE_BATCH_SIZE = 16
 IMAGE_INPUT_SIZE = 224
 
 # Text Model (BERT)
-TEXT_EPOCHS = 10
+TEXT_EPOCHS = 5
 TEXT_LEARNING_RATE = 2e-5
 TEXT_BATCH_SIZE = 16
 TEXT_MAX_LENGTH = 128
 
 # ============ ENSEMBLE WEIGHTS ============
-# Weighted combination: 0.4 tabular + 0.4 image + 0.2 text
+# Weighted combination: 0.4 tabular + 0.2 image + 0.4 text
 ENSEMBLE_WEIGHTS = {
     'tabular': 0.4,
-    'image': 0.4,
-    'text': 0.2
+    'image': 0.2,
+    'text': 0.4
 }
 
 # ============ DATA PARAMETERS ============
 # If SAMPLE_SIZE is None, the entire dataset will be used. Set to an
 # integer to limit the number of rows (useful for fast experiments).
-SAMPLE_SIZE = None  # originally 100 for quick tests
+SAMPLE_SIZE = None
 TRAIN_TEST_SPLIT = 0.2
 RANDOM_SEED = 42
 

@@ -14,22 +14,28 @@ import networkx as nx
 import random
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler as SkStandardScaler
 from torch.utils.data import DataLoader
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from torchvision import transforms
 from PIL import Image
 import os
 import ssl
 
 try:
+    from xgboost import XGBClassifier
+except ImportError:
+    XGBClassifier = None
+
+try:
     import certifi
-    # Ensure requests/urllib use certifi's CA bundle for SSL verification
     os.environ.setdefault('SSL_CERT_FILE', certifi.where())
     _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     ssl._create_default_https_context = lambda: _ssl_ctx
     print('Using certifi CA bundle for SSL certificate verification.')
 except Exception:
-    print('certifi not available; SSL certificate verification may fail when downloading pretrained weights.\nInstall certifi: pip install certifi')
+    print('certifi not available; SSL certificate verification may fail.')
 
 from .config import (
     DEVICE, HYPERGRAPH_EPOCHS, HYPERGRAPH_HIDDEN_DIM, HYPERGRAPH_LEARNING_RATE,
@@ -37,13 +43,14 @@ from .config import (
     IMAGE_INPUT_SIZE, TEXT_EPOCHS, TEXT_LEARNING_RATE, TEXT_BATCH_SIZE,
     TEXT_MAX_LENGTH, OUTPUT_VISUALIZATIONS
 )
-from .models import HypergraphNN, MemeImageDataset, MemeTextDataset
+from .models import HypergraphNN, MemeImageDataset, MemeTextDataset, ImageTabularModel, TextTabularModel
 
 try:
-    from transformers import BertTokenizer, BertForSequenceClassification
+    from transformers import BertTokenizer, BertForSequenceClassification, get_linear_schedule_with_warmup
 except:
     BertTokenizer = None
     BertForSequenceClassification = None
+    get_linear_schedule_with_warmup = None
 
 try:
     import shap
@@ -61,258 +68,208 @@ except:
     Network = None
 
 
-# ============ HYPERGRAPH TRAINING ============
-
-def build_hypergraph(X, n_clusters=8):
-    """
-    Build a hypergraph from data using K-means clustering
-    
-    Args:
-        X: Input feature array
-        n_clusters: Number of clusters for hyperedges
-    
-    Returns:
-        H: Incidence matrix
-        L: Hypergraph Laplacian
-        G: NetworkX graph object
-        hyperedges: Dictionary of hyperedges
-    """
-    # Use K-means clustering to create hyperedges
-    kmeans = KMeans(n_clusters=min(n_clusters, X.shape[0]), random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(X)
-
-    # Create hyperedges based on clusters
-    hyperedges = {}
-    for i in range(len(np.unique(cluster_labels))):
-        hyperedges[i] = np.where(cluster_labels == i)[0].tolist()
-
-    # Create incidence matrix
-    n_nodes = X.shape[0]
-    H = np.zeros((n_nodes, len(hyperedges)))
-    for i, nodes in hyperedges.items():
-        H[nodes, i] = 1
-
-    # Calculate hypergraph Laplacian
-    D_v = np.sum(H, axis=1)
-    D_e = np.sum(H, axis=0)
-    D_v_inv = np.diag(1.0 / np.maximum(D_v, 1e-10))
-    D_e_inv = np.diag(1.0 / np.maximum(D_e, 1e-10))
-    L = np.eye(n_nodes) - D_v_inv @ H @ D_e_inv @ H.T
-
-    # Create graph for visualization
-    G = nx.Graph()
-    for i in range(n_nodes):
-        G.add_node(i)
-    for edge_idx, nodes in hyperedges.items():
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                G.add_edge(nodes[i], nodes[j])
-
-    return H, L, G, hyperedges
-
+# ============ TABULAR MODEL TRAINING (XGBoost) ============
 
 def train_hypergraph_model(X_train, y_train, X_test, y_test):
     """
-    Train hypergraph-based model with visualization
-    
-    Returns:
-        model: Trained HypergraphNN
-        G: NetworkX graph
-        hyperedges: Dictionary of hyperedges
+    Train an XGBoost classifier on tabular features.
+    Returns a model compatible with existing downstream inference code.
     """
-    print("Building hypergraph...")
+    print("Training XGBoost tabular model...")
     if isinstance(X_train, pd.DataFrame):
         X_train = X_train.values
     if isinstance(X_test, pd.DataFrame):
         X_test = X_test.values
 
-    # Build hypergraph
-    H, L, G, hyperedges = build_hypergraph(X_train)
-    print(f"Hypergraph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+    y_train_arr = y_train.values if hasattr(y_train, 'values') else np.array(y_train)
+    y_test_arr  = y_test.values  if hasattr(y_test,  'values') else np.array(y_test)
 
-    # Print Hypergraph Stats
-    print("=== Hypergraph Stats ===")
-    print(f"Number of Nodes: {G.number_of_nodes()}")
-    print(f"Number of Edges: {G.number_of_edges()}")
-    avg_degree = sum(dict(G.degree()).values()) / G.number_of_nodes() if G.number_of_nodes() > 0 else 0
-    print(f"Average Degree: {avg_degree:.2f}")
-    print(f"Number of Hyperedges: {len(hyperedges)}")
-    print("=========================")
+    if XGBClassifier is None:
+        print("XGBoost not installed — falling back to sklearn GradientBoostingClassifier.")
+        from sklearn.ensemble import GradientBoostingClassifier
+        clf = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05,
+                                         max_depth=5, subsample=0.8, random_state=42)
+    else:
+        n_neg = int((y_train_arr == 0).sum())
+        n_pos = int((y_train_arr == 1).sum())
+        scale_pos = n_neg / max(n_pos, 1)
+        clf = XGBClassifier(
+            n_estimators=400,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=3,
+            scale_pos_weight=scale_pos,
+            use_label_encoder=False,
+            eval_metric='logloss',
+            random_state=42,
+            tree_method='hist',
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+        )
 
-    # Get Laplacian eigenvectors
-    eigvals, eigvecs = np.linalg.eigh(L)
-    k = min(3, eigvecs.shape[1] - 1)
-    X_train_hyper = np.hstack([X_train, eigvecs[:, 1:k+1]])
+    clf.fit(X_train, y_train_arr,
+            eval_set=[(X_test, y_test_arr)],
+            verbose=50)
+    
+    # Use best iteration if early stopping was applied
+    if hasattr(clf, 'best_iteration') and clf.best_iteration is not None:
+        print(f"  Best iteration: {clf.best_iteration}")
 
-    # Apply same to test data
-    H_test, L_test, _, _ = build_hypergraph(X_test, n_clusters=len(hyperedges))
-    eigvals_test, eigvecs_test = np.linalg.eigh(L_test)
-    X_test_hyper = np.hstack([X_test, eigvecs_test[:, 1:k+1]])
-
-    # Convert to tensors
-    X_train_tensor = torch.FloatTensor(X_train_hyper)
-    y_train_tensor = torch.LongTensor(y_train.values if hasattr(y_train, 'values') else y_train)
-    X_test_tensor = torch.FloatTensor(X_test_hyper)
-    y_test_tensor = torch.LongTensor(y_test.values if hasattr(y_test, 'values') else y_test)
-
-    # Create and train model
-    input_dim = X_train_hyper.shape[1]
-    model = HypergraphNN(input_dim, HYPERGRAPH_HIDDEN_DIM, 2).to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=HYPERGRAPH_LEARNING_RATE)
-
-    train_loader = DataLoader(
-        list(zip(X_train_tensor, y_train_tensor)),
-        batch_size=HYPERGRAPH_BATCH_SIZE,
-        shuffle=True
-    )
-
-    for epoch in range(HYPERGRAPH_EPOCHS):
-        model.train()
-        total_loss = 0.0
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        if epoch % 5 == 0:
-            print(f"Epoch {epoch}, Loss: {total_loss/len(train_loader):.4f}")
-
-    # Evaluate
-    model.eval()
-    with torch.no_grad():
-        outputs = model(X_test_tensor.to(DEVICE))
-        _, predicted = torch.max(outputs, 1)
-        predicted = predicted.cpu().numpy()
-
-    accuracy = accuracy_score(y_test_tensor, predicted)
-    print(f"Hypergraph Model Accuracy: {accuracy:.4f}")
+    predicted = clf.predict(X_test)
+    accuracy  = accuracy_score(y_test_arr, predicted)
+    print(f"Tabular (XGBoost) Model Accuracy: {accuracy:.4f}")
     print("\nClassification Report:")
-    print(classification_report(y_test_tensor, predicted))
-
-    # PyVis Visualization
-    if Network is not None:
-        try:
-            G_vis = nx.relabel_nodes(G, lambda x: str(x))
-            net = Network(notebook=True, width="1080px", height="1080px",
-                         bgcolor="#1e1e1e", font_color="white", cdn_resources="in_line")
-            
-            # Set options and add nodes/edges
-            sampled_nodes = random.sample(list(G_vis.nodes()), min(100, len(G_vis.nodes())))
-            G_vis = G_vis.subgraph(sampled_nodes).copy()
-            
-            for node in G_vis.nodes():
-                net.add_node(node, label=node)
-            for u, v in G_vis.edges():
-                net.add_edge(u, v)
-            
-            net.show(OUTPUT_VISUALIZATIONS['hypergraph_graph'])
-            print(f"✓ Hypergraph visualization saved as {OUTPUT_VISUALIZATIONS['hypergraph_graph']}")
-            # also save a static PNG using networkx + matplotlib
-            try:
-                plt.figure(figsize=(8, 8))
-                from .config import RANDOM_SEED  # import locally to avoid global
-                pos = nx.spring_layout(G_vis, seed=RANDOM_SEED)
-                nx.draw(G_vis, pos, with_labels=True, node_size=50,
-                        font_size=8, node_color='skyblue', edge_color='gray')
-                png_path = OUTPUT_VISUALIZATIONS.get('hypergraph_graph_png', 'graph_visualization.png')
-                plt.savefig(png_path)
-                plt.close()
-                print(f"✓ Hypergraph static image saved as {png_path}")
-            except Exception as e2:
-                print(f"Could not save static hypergraph image: {e2}")
-        except Exception as e:
-            print(f"Could not create PyVis visualization: {e}")
+    print(classification_report(y_test_arr, predicted))
 
     # Confusion matrix
-    cm = confusion_matrix(y_test_tensor, predicted)
+    cm = confusion_matrix(y_test_arr, predicted)
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Low', 'High'], yticklabels=['Low', 'High'])
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.title('Confusion Matrix - Hypergraph Model')
+    plt.xlabel('Predicted'); plt.ylabel('Actual')
+    plt.title('Confusion Matrix - Tabular Model (XGBoost)')
     plt.savefig(OUTPUT_VISUALIZATIONS['hypergraph_confusion'])
     plt.close()
 
-    return model, G, hyperedges
+    # Build a simple NetworkX graph placeholder for compatibility
+    G = nx.Graph()
+    return clf, G, {}
 
 
 def hypergraph_inference(model, X, scaler=None):
-    """Perform inference using hypergraph model"""
+    """Tabular inference via XGBoost."""
     if isinstance(X, pd.DataFrame):
         X = X.values
-
-    H, L, _, _ = build_hypergraph(X, n_clusters=min(5, len(X)))
-    eigvals, eigvecs = np.linalg.eigh(L)
-    k = min(3, eigvecs.shape[1] - 1)
-    X_hyper = np.hstack([X, eigvecs[:, 1:k+1]])
-
-    X_tensor = torch.FloatTensor(X_hyper).to(DEVICE)
-    model.eval()
-    with torch.no_grad():
-        outputs = model(X_tensor)
-        probs = F.softmax(outputs, dim=1).cpu().numpy()
-        predicted = np.argmax(probs, axis=1)
-
+    probs = model.predict_proba(X)
+    predicted = model.predict(X)
     return predicted, probs
 
 
+# end of tabular section
+
 # ============ IMAGE MODEL TRAINING ============
 
-def train_image_model(X_img_train, y_train, X_img_test, y_test):
-    """Train ResNet50 image model"""
-    print("Training image model...")
+def train_image_model(X_img_train, y_train, X_img_test, y_test, X_tab_train, X_tab_test):
+    """Train EfficientNet-B0 + Tabular early fusion model"""
+    print("Training image model (EfficientNet-B0 + Tabular, 2-phase)...")
     
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.Resize((IMAGE_INPUT_SIZE + 32, IMAGE_INPUT_SIZE + 32)),
+        transforms.RandomCrop(IMAGE_INPUT_SIZE),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        transforms.RandomGrayscale(p=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.15)
+    ])
+    
+    test_transform = transforms.Compose([
         transforms.Resize((IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    train_dataset = MemeImageDataset(X_img_train, y_train, transform=transform)
-    test_dataset = MemeImageDataset(X_img_test, y_test, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False)
+    train_dataset = MemeImageDataset(X_img_train, y_train, transform=train_transform, tab_features=X_tab_train)
+    test_dataset = MemeImageDataset(X_img_test, y_test, transform=test_transform, tab_features=X_tab_test)
+    train_loader = DataLoader(train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
     
-    # Try to load pretrained weights; if download fails (SSL/network), fall back to random init
     try:
-        model = resnet50(weights=ResNet50_Weights.DEFAULT)
-        print("Loaded pretrained ResNet50 weights.")
+        model = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+        print("Loaded pretrained EfficientNet-B0 weights.")
     except Exception as e:
-        print(f"Could not load pretrained ResNet50 weights: {e}\nFalling back to uninitialized ResNet50.")
-        model = resnet50(weights=None)
-
-    model.fc = nn.Linear(2048, 2)
-    model = model.to(DEVICE)
+        print(f"Could not load pretrained EfficientNet-B0: {e}. Using random init.")
+        model = efficientnet_b0(weights=None)
     
-    optimizer = optim.Adam(model.parameters(), lr=IMAGE_LEARNING_RATE)
-    criterion = nn.CrossEntropyLoss()
+    # Wrap with ImageTabularModel
+    tab_dim = X_tab_train.shape[1] if hasattr(X_tab_train, 'shape') else len(X_tab_train[0])
+    model = ImageTabularModel(model, tab_dim=tab_dim).to(DEVICE)
     
-    for epoch in range(IMAGE_EPOCHS):
+    y_train_arr = y_train.values if hasattr(y_train, 'values') else np.array(y_train)
+    class_counts = torch.bincount(torch.tensor(y_train_arr, dtype=torch.long))
+    weights_ce = 1.0 / torch.sqrt(class_counts.float()); weights_ce = weights_ce / weights_ce.sum() * len(class_counts)
+    criterion = nn.CrossEntropyLoss(weight=weights_ce.to(DEVICE), label_smoothing=0.1)
+    
+    # === PHASE 1: Train only classifier head (5 epochs) ===
+    print("  Phase 1: Training classifier head only...")
+    for param in model.effnet.features.parameters():
+        param.requires_grad = False
+    for param in model.fc.parameters():
+        param.requires_grad = True
+    
+    optimizer_p1 = optim.AdamW(model.fc.parameters(), lr=1e-3, weight_decay=1e-2)
+    for epoch in range(5):
         model.train()
         total_loss = 0.0
-        for images, labels in train_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(images)
+        for images, tabs, labels in train_loader:
+            images, tabs, labels = images.to(DEVICE), tabs.to(DEVICE), labels.to(DEVICE)
+            optimizer_p1.zero_grad()
+            outputs = model(images, tabs)
             loss = criterion(outputs, labels)
             loss.backward()
-            optimizer.step()
+            optimizer_p1.step()
             total_loss += loss.item()
-        print(f"Image Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}")
+        print(f"  P1 Epoch {epoch+1}/5, Loss: {total_loss/len(train_loader):.4f}")
+    
+    # === PHASE 2: Unfreeze features.4-8 + classifier, fine-tune (10 epochs) ===
+    print("  Phase 2: Fine-tuning features.4-8 + classifier...")
+    for name, param in model.named_parameters():
+        if any(f"features.{i}" in name for i in range(4, 9)) or "fc" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    
+    optimizer_p2 = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                               lr=IMAGE_LEARNING_RATE, weight_decay=5e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer_p2, T_max=10)
+    
+    best_acc = 0.0
+    best_model_state = None
+    for epoch in range(10):
+        model.train()
+        total_loss = 0.0
+        for images, tabs, labels in train_loader:
+            images, tabs, labels = images.to(DEVICE), tabs.to(DEVICE), labels.to(DEVICE)
+            optimizer_p2.zero_grad()
+            outputs = model(images, tabs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer_p2.step()
+            total_loss += loss.item()
+        scheduler.step()
+        
+        # Quick val check
+        model.eval()
+        correct = 0; total_count = 0
+        with torch.no_grad():
+            for images, tabs, labels_val in test_loader:
+                images, tabs, labels_val = images.to(DEVICE), tabs.to(DEVICE), labels_val.to(DEVICE)
+                outputs_val = model(images, tabs)
+                _, preds = torch.max(outputs_val, 1)
+                correct += (preds == labels_val).sum().item()
+                total_count += labels_val.size(0)
+        val_acc = correct / total_count
+        
+        print(f"  P2 Epoch {epoch+1}/10, Loss: {total_loss/len(train_loader):.4f}, Val Acc: {val_acc:.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
+        
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_model_state = model.state_dict()
+    
+    if best_model_state:
+        model.load_state_dict(best_model_state)
     
     # Evaluate
     model.eval()
     all_preds, all_probs = [], []
     with torch.no_grad():
-        for images, labels in test_loader:
-            images = images.to(DEVICE)
-            outputs = model(images)
+        for images, tabs, _ in test_loader:
+            images, tabs = images.to(DEVICE), tabs.to(DEVICE)
+            outputs = model(images, tabs)
             probs = F.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
             all_preds.extend(preds.cpu().numpy())
@@ -334,74 +291,107 @@ def train_image_model(X_img_train, y_train, X_img_test, y_test):
     plt.savefig(OUTPUT_VISUALIZATIONS['image_confusion'])
     plt.close()
     
-    return model, transform
+    return model, test_transform
 
 
-def image_inference(model, image_path, transform):
-    """Inference function for image model"""
-    if transform is None:
-        return None, None
-    
+def image_inference(model, image_path, transform, tab_features):
+    """Make inference on a single image. `tab_features` must be a 2D tensor or numpy array."""
+    model.eval()
     try:
         image = Image.open(image_path).convert('RGB')
-    except:
-        image = Image.new('RGB', (IMAGE_INPUT_SIZE, IMAGE_INPUT_SIZE), color='gray')
-    
-    image_tensor = transform(image).unsqueeze(0).to(DEVICE)
-    model = model.to(DEVICE)
-    model.eval()
-    
-    with torch.no_grad():
-        outputs = model(image_tensor)
-        probs = F.softmax(outputs, dim=1)
-        _, predicted = torch.max(probs, 1)
-    
-    return predicted.cpu().numpy(), probs.cpu().numpy()
+        image = transform(image).unsqueeze(0).to(DEVICE)
+        
+        if not isinstance(tab_features, torch.Tensor):
+            tab_features = torch.tensor(tab_features, dtype=torch.float32)
+        tab_features = tab_features.to(DEVICE)
+        
+        with torch.no_grad():
+            outputs = model(image, tab_features)
+            probs = F.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+        return predicted.cpu().numpy(), probs.cpu().numpy()
+    except Exception as e:
+        print(f"Image inference error: {e}")
+        return None, None
 
 
 # ============ TEXT MODEL TRAINING ============
 
-def train_text_model(X_txt_train, y_train, X_txt_test, y_test):
-    """Train BERT text model with attention & SHAP visualization"""
-    print("Training text model...")
-    
+def train_text_model(X_txt_train, y_train, X_txt_test, y_test, X_tab_train, X_tab_test):
+    """Train BERT + Tabular early fusion text model"""
+    print("Training text model (BERT + Tabular, LR warmup)...")
     if BertTokenizer is None or BertForSequenceClassification is None:
-        print("BERT not available, skipping text model...")
+        print("Transformers library not installed. Skipping text model.")
         return None, None
-    
+        
     try:
         tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        model = BertForSequenceClassification.from_pretrained(
-            'bert-base-uncased', num_labels=2, output_attentions=True
-        ).to(DEVICE)
-    except:
-        print("Could not load BERT, skipping...")
+    except Exception as e:
+        print(f"Could not load BERT tokenizer: {e}")
+        return None, None
+        
+    try:
+        base_model = BertForSequenceClassification.from_pretrained(
+            'bert-base-uncased', num_labels=2
+        )
+        tab_dim = X_tab_train.shape[1] if hasattr(X_tab_train, 'shape') else len(X_tab_train[0])
+        model = TextTabularModel(base_model, tab_dim=tab_dim).to(DEVICE)
+    except Exception as e:
+        print(f"Could not load BERT: {e}")
         return None, None
     
-    train_dataset = MemeTextDataset(X_txt_train, y_train, tokenizer, TEXT_MAX_LENGTH)
-    test_dataset = MemeTextDataset(X_txt_test, y_test, tokenizer, TEXT_MAX_LENGTH)
-    train_loader = DataLoader(train_dataset, batch_size=TEXT_BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=TEXT_BATCH_SIZE, shuffle=False)
+    train_dataset = MemeTextDataset(X_txt_train, y_train, tokenizer, TEXT_MAX_LENGTH, tab_features=X_tab_train)
+    test_dataset  = MemeTextDataset(X_txt_test,  y_test,  tokenizer, TEXT_MAX_LENGTH, tab_features=X_tab_test)
+    train_loader  = DataLoader(train_dataset, batch_size=TEXT_BATCH_SIZE, shuffle=True)
+    test_loader   = DataLoader(test_dataset,  batch_size=TEXT_BATCH_SIZE, shuffle=False)
     
-    optimizer = optim.AdamW(model.parameters(), lr=TEXT_LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=TEXT_LEARNING_RATE, weight_decay=0.01)
+    total_steps = len(train_loader) * TEXT_EPOCHS
+    warmup_steps = total_steps // 10
+    if get_linear_schedule_with_warmup is not None:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+        )
+    else:
+        scheduler = None
+    
+    # Use label smoothing to prevent overfitting
+    y_train_arr = y_train.values if hasattr(y_train, 'values') else np.array(y_train); class_counts = torch.bincount(torch.tensor(y_train_arr, dtype=torch.long)); weights_ce = 1.0 / torch.sqrt(class_counts.float()); weights_ce = weights_ce / weights_ce.sum() * len(class_counts); criterion_txt = nn.CrossEntropyLoss(weight=weights_ce.to(DEVICE), label_smoothing=0.1)
     
     for epoch in range(TEXT_EPOCHS):
         model.train()
         total_loss = 0.0
         for batch in train_loader:
-            input_ids = batch['input_ids'].to(DEVICE)
+            input_ids     = batch['input_ids'].to(DEVICE)
             attention_mask = batch['attention_mask'].to(DEVICE)
-            labels = batch['labels'].to(DEVICE)
+            labels         = batch['labels'].to(DEVICE)
+            tabs           = batch['tab_features'].to(DEVICE)
             
             optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, tab=tabs)
+            loss = criterion_txt(outputs, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if scheduler:
+                scheduler.step()
             total_loss += loss.item()
         
-        if (epoch + 1) % 3 == 0:
-            print(f"Text Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}")
+        # Quick val check each epoch
+        model.eval()
+        correct = 0; total_count = 0
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids = batch['input_ids'].to(DEVICE)
+                attention_mask = batch['attention_mask'].to(DEVICE)
+                tabs = batch['tab_features'].to(DEVICE)
+                labels_val = batch['labels'].to(DEVICE)
+                outputs_val = model(input_ids=input_ids, attention_mask=attention_mask, tab=tabs)
+                _, preds = torch.max(outputs_val, 1)
+                correct += (preds == labels_val).sum().item()
+                total_count += labels_val.size(0)
+        val_acc = correct / total_count
+        print(f"Text Epoch {epoch+1}/{TEXT_EPOCHS}, Loss: {total_loss/len(train_loader):.4f}, Val Acc: {val_acc:.4f}")
     
     # Evaluate
     model.eval()
@@ -410,9 +400,10 @@ def train_text_model(X_txt_train, y_train, X_txt_test, y_test):
         for batch in test_loader:
             input_ids = batch['input_ids'].to(DEVICE)
             attention_mask = batch['attention_mask'].to(DEVICE)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            probs = F.softmax(outputs.logits, dim=1)
-            _, preds = torch.max(outputs.logits, 1)
+            tabs = batch['tab_features'].to(DEVICE)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, tab=tabs)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
             all_preds.extend(preds.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
     
@@ -435,25 +426,34 @@ def train_text_model(X_txt_train, y_train, X_txt_test, y_test):
     return model, tokenizer
 
 
-def text_inference(model, text, tokenizer):
-    """Inference function for text model"""
-    if model is None or tokenizer is None:
-        return None, None
-    
-    # Use tokenizer as callable instead of encode_plus (newer API)
-    encoding = tokenizer(
-        text, add_special_tokens=True, max_length=TEXT_MAX_LENGTH,
-        return_token_type_ids=False, padding='max_length', truncation=True,
-        return_attention_mask=True, return_tensors='pt'
-    )
-    
-    input_ids = encoding['input_ids'].to(DEVICE)
-    attention_mask = encoding['attention_mask'].to(DEVICE)
-    
+def text_inference(model, text, tokenizer, tab_features):
+    """Make inference on a single text string. `tab_features` must be a 2D tensor or numpy array."""
     model.eval()
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        probs = F.softmax(outputs.logits, dim=1)
-        _, predicted = torch.max(outputs.logits, 1)
-    
-    return predicted.cpu().numpy(), probs.cpu().numpy()
+    try:
+        encoding = tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=TEXT_MAX_LENGTH,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+        
+        input_ids = encoding['input_ids'].to(DEVICE)
+        attention_mask = encoding['attention_mask'].to(DEVICE)
+        
+        if not isinstance(tab_features, torch.Tensor):
+            tab_features = torch.tensor(tab_features, dtype=torch.float32)
+        tab_features = tab_features.to(DEVICE)
+        
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, tab=tab_features)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+            
+        return preds.cpu().numpy(), probs.cpu().numpy()
+    except Exception as e:
+        print(f"Text inference error: {e}")
+        return None, None

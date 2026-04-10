@@ -53,10 +53,17 @@ def save_models(models, output_dir=MODELS_DIR):
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save hypergraph model
+    # Save hypergraph / tabular model
     if models['hypergraph_model'] is not None:
-        torch.save(models['hypergraph_model'].state_dict(),
-                  os.path.join(output_dir, 'hypergraph_model.pt'))
+        hg_model = models['hypergraph_model']
+        if hasattr(hg_model, 'state_dict'):
+            # PyTorch model
+            torch.save(hg_model.state_dict(),
+                      os.path.join(output_dir, 'hypergraph_model.pt'))
+        else:
+            # sklearn / XGBoost model — use joblib
+            import joblib
+            joblib.dump(hg_model, os.path.join(output_dir, 'hypergraph_model.pkl'))
     
     # Save image model
     if models['image_model'] is not None:
@@ -65,7 +72,8 @@ def save_models(models, output_dir=MODELS_DIR):
     
     # Save text model
     if models['text_model'] is not None:
-        models['text_model'].save_pretrained(os.path.join(output_dir, 'text_model'))
+        torch.save(models['text_model'].state_dict(),
+                  os.path.join(output_dir, 'text_model.pt'))
     
     # Save tokenizer
     if models['tokenizer'] is not None:

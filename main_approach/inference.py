@@ -10,7 +10,7 @@ from .train import (
 )
 from .utils import ensemble_predictions
 from .config import DEVICE, MODELS_DIR
-from .models import HypergraphNN
+from .models import HypergraphNN, ImageTabularModel, TextTabularModel
 
 
 class MemeViralityPredictor:
@@ -34,25 +34,26 @@ class MemeViralityPredictor:
         """Load all trained models from directory"""
         try:
             # Load hypergraph model
-            self.hypergraph_model = HypergraphNN(4, 64, 2).to(DEVICE)
+            self.hypergraph_model = HypergraphNN(12, 128, 2).to(DEVICE)
             hypergraph_path = os.path.join(models_dir, 'hypergraph_model.pt')
             if os.path.exists(hypergraph_path):
                 self.hypergraph_model.load_state_dict(torch.load(hypergraph_path))
-                print("✓ Hypergraph model loaded")
+                print("[OK] Hypergraph model loaded")
         except Exception as e:
             print(f"Warning: Could not load hypergraph model: {e}")
         
         try:
             # Load image model
-            from torchvision.models import resnet50, ResNet50_Weights
-            self.image_model = resnet50(weights=ResNet50_Weights.DEFAULT).to(DEVICE)
-            self.image_model.fc = torch.nn.Linear(2048, 2)
+            from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+            base_img = efficientnet_b0(weights=None).to(DEVICE)
+            self.image_model = ImageTabularModel(base_img, tab_dim=7, num_classes=2).to(DEVICE)
             image_path = os.path.join(models_dir, 'image_model.pt')
             if os.path.exists(image_path):
-                self.image_model.load_state_dict(torch.load(image_path))
-                print("✓ Image model loaded")
+                self.image_model.load_state_dict(torch.load(image_path, map_location=DEVICE))
+                print("[OK] Image model loaded")
         except Exception as e:
             print(f"Warning: Could not load image model: {e}")
+            import traceback; traceback.print_exc()
         
         try:
             # Load text model and tokenizer
@@ -61,11 +62,13 @@ class MemeViralityPredictor:
             tokenizer_path = os.path.join(models_dir, 'tokenizer')
             
             if os.path.exists(text_model_path):
-                self.text_model = BertForSequenceClassification.from_pretrained(text_model_path)
+                base_txt = BertForSequenceClassification.from_pretrained(text_model_path)
+                self.text_model = TextTabularModel(base_txt, tab_dim=7, num_classes=2).to(DEVICE)
                 self.tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
-                print("✓ Text model and tokenizer loaded")
+                print("[OK] Text model and tokenizer loaded")
         except Exception as e:
             print(f"Warning: Could not load text model: {e}")
+            import traceback; traceback.print_exc()
         
         try:
             # Load image transform config
@@ -75,7 +78,7 @@ class MemeViralityPredictor:
                 with open(config_path) as f:
                     config = json.load(f)
                 self.image_transform = create_transform(config)
-                print("✓ Image transform loaded")
+                print("[OK] Image transform loaded")
         except Exception as e:
             print(f"Warning: Could not load image transform: {e}")
     
@@ -86,16 +89,15 @@ class MemeViralityPredictor:
         Args:
             image_path: Path to meme image
             text: Text content of meme
-            categorical_features: Array of shape (2,) with [section_encoded, time_encoded]
-        
-        Returns:
-            prediction: Binary prediction (0=Low, 1=High virality)
-            confidence: Confidence score
-            individual_predictions: Dict with predictions from each model
+        A list or array of 7 features is expected: 
+        ['Upvotes', 'Comments', 'Karma', 'Text_Length', 'section_encoded', 'time_encoded', 'Upvote_Ratio']
         """
         if categorical_features is None:
-            categorical_features = np.array([[0, 0]])
-        
+            # Default fallback 7-dimensional vector
+            categorical_features = np.zeros((1, 7), dtype=np.float32)
+        else:
+            categorical_features = np.array(categorical_features).reshape(1, -1)
+            
         # Get predictions from each model
         predictions = {}
         
@@ -109,16 +111,16 @@ class MemeViralityPredictor:
         
         # Image
         if self.image_model is not None and self.image_transform is not None:
-            img_pred, img_prob = image_inference(self.image_model, image_path, self.image_transform)
+            img_pred, img_prob = image_inference(self.image_model, image_path, self.image_transform, categorical_features)
             if img_pred is not None:
                 predictions['image'] = {
-                    'pred': ['Low', 'High'][img_pred[0][0]],
-                    'confidence': img_prob[0][img_pred[0][0]]
+                    'pred': ['Low', 'High'][img_pred[0]],
+                    'confidence': img_prob[0][img_pred[0]]
                 }
         
         # Text
         if self.text_model is not None and self.tokenizer is not None:
-            txt_pred, txt_prob = text_inference(self.text_model, text, self.tokenizer)
+            txt_pred, txt_prob = text_inference(self.text_model, text, self.tokenizer, categorical_features)
             if txt_pred is not None:
                 predictions['text'] = {
                     'pred': ['Low', 'High'][txt_pred[0]],
@@ -174,7 +176,7 @@ if __name__ == "__main__":
     result = predictor.predict(
         image_path="path/to/meme.jpg",
         text="Your meme text here",
-        categorical_features=np.array([[0, 2]])  # [section_encoded, time_encoded]
+        categorical_features=np.array([[500, 20, 1000, 25, 0, 2, 0.95]])  # 7 features
     )
     
     print(f"\nPrediction Result:")

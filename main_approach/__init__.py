@@ -24,7 +24,6 @@ from .config import *
 from .data import load_data, preprocess_data
 from .models import HypergraphNN, MemeImageDataset, MemeTextDataset
 from .train import (
-    build_hypergraph,
     train_hypergraph_model,
     train_image_model,
     train_text_model,
@@ -41,7 +40,6 @@ __all__ = [
     'HypergraphNN',
     'MemeImageDataset',
     'MemeTextDataset',
-    'build_hypergraph',
     'train_hypergraph_model',
     'train_image_model',
     'train_text_model',

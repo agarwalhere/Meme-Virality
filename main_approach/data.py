@@ -35,9 +35,18 @@ def load_data(sample_size=SAMPLE_SIZE):
         df = pd.read_csv(DATA_PATH, encoding="ISO-8859-1")
         print(f"Original dataset loaded with {len(df)} rows")
 
-        # Drop rows with missing values
-        df = df.dropna()
-        print(f"Dataset after dropping missing values: {len(df)} rows")
+        # Fill missing values instead of dropping to keep all data
+        if 'Extracted Text' in df.columns:
+            df['Extracted Text'] = df['Extracted Text'].fillna(' ')
+        if 'section' in df.columns:
+            df['section'] = df['section'].fillna('unknown')
+        if 'Upvotes' in df.columns:
+            df['Upvotes'] = df['Upvotes'].fillna(0)
+        
+        # Drop only rows missing essential File Name
+        if 'File Name' in df.columns:
+            df = df.dropna(subset=['File Name'])
+        print(f"Dataset after handling missing values: {len(df)} rows")
 
         # Randomly sample N rows if a limit is specified
         if sample_size is None or sample_size >= len(df):
@@ -63,40 +72,50 @@ def preprocess_data(df, images_path):
         Tuple of (X_cat_train, X_cat_test, X_img_train, X_img_test, 
                   X_txt_train, X_txt_test, y_train, y_test, df)
     """
-    # Ensure required columns exist
-    if 'timestamp' not in df.columns:
-        df['timestamp'] = pd.to_datetime('2023-01-01')
-    else:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    df['hour'] = df['timestamp'].dt.hour
+    # Ensure required columns exist by mapping from dataset
+    if 'Category' in df.columns:
+        df['section'] = df['Category'].fillna('unknown')
+    elif 'section' not in df.columns:
+        df['section'] = 'unknown'
 
-    # Extract time of day
-    def get_time_of_day(hour):
-        if 0 <= hour < 6:
-            return 'night'
-        elif 6 <= hour < 12:
-            return 'morning'
-        elif 12 <= hour < 18:
-            return 'afternoon'
+    if 'Time of Day' in df.columns:
+        df['time_of_day'] = df['Time of Day'].str.lower().fillna('night')
+    elif 'time_of_day' not in df.columns:
+        if 'timestamp' in df.columns:
+            df['time_of_day'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.hour.apply(
+                lambda h: 'night' if 0<=h<6 else 'morning' if 6<=h<12 else 'afternoon' if 12<=h<18 else 'evening'
+            ).fillna('night')
         else:
-            return 'evening'
+            df['time_of_day'] = 'night'
 
-    df['time_of_day'] = df['hour'].apply(get_time_of_day)
+    if 'Author' in df.columns:
+        df['author'] = df['Author'].fillna('anon')
+    else:
+        df['author'] = 'anon'
 
     # Encode categorical variables
     le_section = LabelEncoder()
     le_time = LabelEncoder()
+    le_author = LabelEncoder()
     
-    if 'section' in df.columns:
-        df['section_encoded'] = le_section.fit_transform(df['section'])
-    else:
-        df['section_encoded'] = 0
-        
-    df['time_encoded'] = le_time.fit_transform(df['time_of_day'])
+    df['section_encoded'] = le_section.fit_transform(df['section'].astype(str))
+    df['time_encoded'] = le_time.fit_transform(df['time_of_day'].astype(str))
+    df['author_encoded'] = le_author.fit_transform(df['author'].astype(str))
 
-    # Only use non-virality features
-    categorical_features = df[['section_encoded', 'time_encoded']]
+    from sklearn.preprocessing import StandardScaler
+    df['Total Karma'] = pd.to_numeric(df.get('Total Karma', 0), errors='coerce').fillna(0)
+    df['Comment Karma'] = pd.to_numeric(df.get('Comment Karma', 0), errors='coerce').fillna(0)
+    df['Upvote Ratio'] = pd.to_numeric(df.get('Upvote Ratio', 0.5), errors='coerce').fillna(0.5)
+    df['Number of Comments'] = pd.to_numeric(df.get('Number of Comments', 0), errors='coerce').fillna(0)
+    scaler = StandardScaler()
+    scaled_nums = scaler.fit_transform(df[['Total Karma', 'Comment Karma', 'Upvote Ratio', 'Number of Comments']])
+    df['total_karma_scaled'] = scaled_nums[:, 0]
+    df['comment_karma_scaled'] = scaled_nums[:, 1]
+    df['upvote_ratio_scaled'] = scaled_nums[:, 2]
+    df['num_comments_scaled'] = scaled_nums[:, 3]
+
+    # Only use non-virality features for hypergraph structural graph
+    categorical_features = df[['section_encoded', 'time_encoded', 'author_encoded', 'total_karma_scaled', 'comment_karma_scaled', 'upvote_ratio_scaled', 'num_comments_scaled']]
 
     # Target and text features
     # Ensure we derive a consistent binary 'virality' label similar to the notebook.
@@ -127,8 +146,20 @@ def preprocess_data(df, images_path):
     else:
         text_features = pd.Series(['sample text'] * len(df))
 
+    df['Title_Text'] = df.get('Title', '').fillna('')
+    df['Sub_Text'] = df.get('Category', '').fillna('unknown')
+    
+    text_features = "[" + df['Sub_Text'].astype(str) + "] " + df['Title_Text'].astype(str) + " [SEP] " + text_features.astype(str)
+
     if 'File Name' in df.columns:
-        image_paths = df['File Name'].apply(lambda x: os.path.join(images_path, str(x)))
+        import glob
+        def get_actual_img_path(csv_fname):
+            prefix = str(csv_fname).split('_')[0]
+            matches = glob.glob(os.path.join(images_path, f"{prefix}_*"))
+            if len(matches) > 0:
+                return matches[0]
+            return os.path.join(images_path, str(csv_fname))
+        image_paths = df['File Name'].apply(get_actual_img_path)
     else:
         image_paths = pd.Series([os.path.join(images_path, f'{i}.jpg') for i in range(len(df))])
 
